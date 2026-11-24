@@ -13,7 +13,7 @@ Methods (each runs one command line, output captured, never printed):
 - `run(line, images=False)`: any REPL command; returns its text, or
   `(text, [image bytes])` with `images=True`. `q` raises `ValueError`.
 - `go(target)`, `url()`, `page(parts=1, hide_images=False)` → `(text, images)`,
-  `links(filter="")`, `click(target, fields=None)`, `dump(file="")`,
+  `links(filter="")`, `click(target, fields=None)`, `submit(fields)`, `dump(file="", command="")`, `same_dump(file, command="")`,
   `history(n=None)`, `toggle()` (`@`).
 - `serve_mcp(port=12549)`: also serve this browser as MCP tools (as
   [2-mcp.md](2-mcp.md)); returns False if the port is busy.

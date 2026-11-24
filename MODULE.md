@@ -52,7 +52,9 @@ Every method runs one REPL command and returns the text the REPL would print
 | `page(parts=1, hide_images=False)` | `p` / `pp`, returns `(text, [image bytes])` |
 | `links(filter="")` | `l` |
 | `click(target, fields=None)` | `c` (number, text or `/regex/`; `fields` is `{name: value}`) |
-| `dump(file="")` | `d` |
+| `submit(fields)` | `s` (`fields` is `{name: value}`, Enter in the last one) |
+| `dump(file="", command="")` | `d` |
+| `same_dump(file, command="")` | `d ?<file> [command]` |
 | `history(n=None)` | `h` |
 | `toggle()` | `@` (headless ↔ headed) |
 | `serve_mcp(port=12549)` | also serve this browser as MCP tools; `False` if the port is busy |

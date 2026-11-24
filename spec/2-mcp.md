@@ -63,10 +63,12 @@ command comes from the terminal or from MCP.
 | `current_url()` | `u` | the current url |
 | `page(hide_images=false, pages=1)` | `p [n]` / `pp [n]` | the annotated screenshot as one or more images, plus the buttons/fields list |
 | `save_page(n, file, hide_images=false)` | `p <n> <file>` | part `n` as an image, copied as png to `file` |
-| `same_page(n, file, hide_images=false)` | `p <n> ?<file>` | percentage of pixels that match the png in `file`, rounded to a whole percent with `%` (`0%` if there is no part `n`; if `file` does not exist, part `n` is saved there and `100%` returned; error if unreadable) |
+| `same_page(n, file, hide_images=false)` | `p <n> ?<file>` | percentage of pixels that match the png in `file`, rounded to a whole percent with `%` (`0%` if there is no part `n`; if `file` does not exist, part `n` is saved there and `100%` returned; error if unreadable; then part `n` replaces `file`) |
 | `links(filter="")` | `l` | numbered `[text] url` lines; `filter` is a substring or `/regex/` |
 | `click(target, fields={})` | `c` | button number, text or `/regex/`; `fields` maps name (or unique prefix) to value |
-| `dump(file="")` | `d` | the page as markdown (no images), or written to `file` |
+| `submit(fields)` | `s` | fill `fields` (name or unique prefix to value), then press Enter in the last one |
+| `same_dump(file, command="")` | `d ?<file> [command]` | `true` if the output (of `command` on the page html, or the markdown) is the same as the content of `file`, else `false`; `file` is then replaced by the new output (missing: written, `true`) |
+| `dump(file="", command="")` | `d` | the page as markdown (no images), or written to `file`; with `command`, the page html piped to that shell command and its output written to `file` (returned if no `file`) |
 | `history(n=null)` | `h` | site history, or go to entry `n` / back `-n` |
 | `toggle_headed()` | `@` | relaunch Chrome headless ↔ headed, keeping profile, tabs, page, history; returns `headed: <url>` / `headless: <url>` |
 | `repl(command)` | any | one REPL command line run verbatim (`q` refused); returns what the REPL prints, plus the images for `p`/`pp` |

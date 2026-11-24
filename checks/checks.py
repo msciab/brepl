@@ -1,125 +1,123 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = [
-#     "mcp>=2.3.0",
-#     "playwright>=1.45",
-#     "html2text>=2025.4.15",
-# ]
+# dependencies = ["mcp>=2.3.0"]
 # ///
-"""Compare saved X and LinkedIn page screenshots with their current versions."""
+"""Notify when the latest X / LinkedIn post of the listed accounts changes (see checks.md).
 
+Usage: ./checks.py [path/to/.mcp.json]   (default ../.mcp.json)
+Uses the brepl already running; never starts one.
+"""
 from __future__ import annotations
 
-import os
-import re
+import asyncio
+import json
+import random
 import sys
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent  # ../brepl.py
-PROFILE_DIR = SCRIPT_DIR / ".brepl-profile"
-THRESHOLDS = {"xcom": 80, "linkedin": 90}  # min matching-pixel %
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 
-sys.path.insert(0, str(PROJECT_ROOT))
+DIR = Path(__file__).resolve().parent
+PAUSE = 30  # seconds between checks
+SITES = {  # site -> (host, url path prefix -> saved name prefix, extractor)
+    "xcom": ("x.com", {"": ""}, DIR / "xcom-latest.py"),
+    "linkedin": ("linkedin.com", {"in/": "", "company/": "company-"}, DIR / "li-latest.py"),
+}
 
-from brepl import Brepl
+
+def page_url(site: str, name: str) -> str:
+    if site == "xcom":
+        return f"https://x.com/{name}"
+    if name.startswith("company-"):
+        return f"https://www.linkedin.com/company/{name.removeprefix('company-')}/posts/?feedView=all"
+    return f"https://linkedin.com/in/{name}/recent-activity/all"
 
 
-def read_entries(path: Path) -> list[str]:
+def read_names(site: str) -> list[str]:
+    host, prefixes, _ = SITES[site]
+    path = DIR / site / "000.txt"
     try:
-        entries = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+        lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as e:
-        raise RuntimeError(f"cannot read {path}: {e}") from e
-    entries = [entry for entry in entries if entry and not entry.startswith("#")]
-    for entry in entries:
-        if entry in {".", ".."} or "/" in entry or "\\" in entry or any(c.isspace() for c in entry):
-            raise RuntimeError(f"invalid account identifier in {path}: {entry!r}")
-    return entries
+        print(f"ERROR cannot read {path}: {e}", file=sys.stderr)
+        return []
+    names = []
+    for line in map(str.strip, lines):
+        if not line or line.startswith("#"):
+            continue
+        name = line
+        if "/" in line:
+            u, name = urlparse(line), ""
+            part = u.path.lstrip("/")
+            if u.scheme in ("http", "https") and u.netloc.removeprefix("www.") == host:
+                for prefix, tag in prefixes.items():
+                    if part.startswith(prefix) and part[len(prefix):].split("/")[0]:
+                        name = tag + part[len(prefix):].split("/")[0]
+                        break
+        name = unquote(name)
+        if not name or name in (".", "..") or any(c.isspace() or c == "\\" for c in name):
+            print(f"ERROR {path}: invalid line {line!r}", file=sys.stderr)
+            continue
+        names.append(name)
+    return names
 
 
-def navigate(browser: Brepl, target: str) -> None:
-    result = browser.go(target).strip()
-    if result.startswith(("error:", "no current site", "usage:")):
-        raise RuntimeError(result)
-    current_url = browser.url()
-    if urlparse(current_url).scheme not in {"http", "https"}:
-        raise RuntimeError(f"navigation did not reach a web page: {current_url or result}")
+def server_url(mcp_json: Path) -> str:
+    return json.loads(mcp_json.read_text())["mcpServers"]["brepl"]["url"]
 
 
-def matching_percent(result: str) -> int:
-    match = re.fullmatch(r"(\d{1,3})%", result.strip())
-    if not match or int(match.group(1)) > 100:
-        raise RuntimeError(f"unexpected screenshot comparison result: {result.strip()!r}")
-    return int(match.group(1))
+async def repl(session: ClientSession, line: str) -> str:
+    result = await session.call_tool("repl", {"command": line})
+    return "\n".join(c.text for c in result.content if getattr(c, "type", "") == "text").strip()
 
 
-def check_site(
-    browser: Brepl,
-    site: str,
-    base_target: str,
-    entries: list[str],
-    page_url,
-    encode=lambda entry: entry,
-) -> int:
-    if not entries:
-        return 0
+async def check(session: ClientSession, site: str, name: str) -> None:
+    url = page_url(site, name)
+    out = await repl(session, f"g {url}")
+    if out.startswith(("error:", "usage:")):
+        raise RuntimeError(out)
+    saved = DIR / site / f"{name}.html"
+    verdict = await repl(session, f"d ?{saved} {SITES[site][2]}")
+    if verdict not in ("true", "false"):
+        raise RuntimeError(f"cannot compare the latest post: {verdict!r}")
+    print(f"{site}/{name}: {'same' if verdict == 'true' else 'NEW POST'}", flush=True)
+    if verdict == "false":
+        print(await repl(session, f"n changed {url}"), flush=True)
+
+
+async def main() -> int:
+    mcp_json = Path(sys.argv[1]) if len(sys.argv) > 1 else DIR.parent / ".mcp.json"
     try:
-        navigate(browser, base_target)
-    except Exception as e:
-        print(f"ERROR {site}: cannot open {base_target}: {e}", file=sys.stderr)
+        url = server_url(mcp_json)
+    except (OSError, KeyError, ValueError) as e:
+        print(f"ERROR no brepl server in {mcp_json}: {e}", file=sys.stderr)
         return 1
-
-    failures = 0
-    for entry in map(encode, entries):
-        url = page_url(entry)
-        image = f"{site}/{entry}.png"
-        try:
-            target = f"/{entry}" if site == "xcom" else url
-            navigate(browser, target)
-            result = browser.run(f"p 1 ?{image}")
-            score = matching_percent(result)
-            print(f"{site}/{entry}: {score}% match")
-            if score < THRESHOLDS[site]:
-                print(browser.run(f"n changed {url}").strip())
-        except Exception as e:
-            print(f"ERROR {site}/{entry}: {e}", file=sys.stderr)
-            failures += 1
-    return failures
-
-
-def main() -> int:
-    try:
-        x_accounts = read_entries(SCRIPT_DIR / "xcom" / "000.txt")
-        linkedin_accounts = read_entries(SCRIPT_DIR / "linkedin" / "000.txt")
-    except RuntimeError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 1
-
-    os.chdir(SCRIPT_DIR)
-    try:
-        with Brepl(profile=str(PROFILE_DIR)) as browser:
-            failures = check_site(
-                browser,
-                "xcom",
-                "x.com",
-                x_accounts,
-                lambda entry: f"https://x.com/{entry}",
-            )
-            failures += check_site(
-                browser,
-                "linkedin",
-                "linkedin.com",
-                linkedin_accounts,
-                lambda entry: f"https://linkedin.com/in/{entry}/recent-activity/all",
-                lambda entry: quote(unquote(entry), safe=""),  # é -> %C3%A9, no double-encoding
-            )
-    except Exception as e:
-        print(f"ERROR: cannot start brepl: {e}", file=sys.stderr)
-        return 1
-    return 1 if failures else 0
+    async with streamable_http_client(url) as (read, write, *_):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            while True:
+                todo = [(s, n) for s in SITES for n in read_names(s)]
+                random.shuffle(todo)
+                if not todo:
+                    print("nothing to check", file=sys.stderr)
+                for site, name in todo:
+                    try:
+                        await check(session, site, name)
+                    except Exception as e:
+                        print(f"ERROR {site}/{name}: {e}", file=sys.stderr, flush=True)
+                    await asyncio.sleep(PAUSE)
+                if not todo:
+                    await asyncio.sleep(PAUSE)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        sys.exit(asyncio.run(main()))
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:  # e.g. brepl not running
+        print(f"ERROR brepl not reachable (start it first): {e!r}", file=sys.stderr)
+        sys.exit(1)

@@ -1,47 +1,57 @@
-Create `checks.py` as a uv script using the `Brepl` module documented in
-`../MODULE.md`, importing `../brepl.py` (add the parent directory to
-`sys.path`), run from this
-directory, and use the persistent Chrome profile in `.brepl-profile` so the
-saved logins are available. The script reads account identifiers from the
-newline-delimited files below and uses the existing PNGs as comparison
-baselines.
+Create `checks.py` as a uv script.
 
-`checks.sh` runs `checks.py` from this directory in an endless loop, every
-`INTERVAL` minutes (a variable at the top, default 30). A failed run is
-reported to stderr and the loop continues; Ctrl-C stops it.
+it  is a python script connecting to a browser availabe as `brepl` mcp server  connected over http using an .mcp.json passed ad parameters. Read its spec from ../README.md
 
-## X
+---
 
-Open `x.com` once. For every non-empty identifier in `xcom/000.txt`, navigate
-to `/{identifier}` and compare the first screenshot part with
-`xcom/{identifier}.png`, equivalent to:
+It reads the following files
 
-```text
-g x.com
-g /MiaAI_Lab
-p 1 ?xcom/MiaAI_Lab.png
-```
+- likedin/000.txt
+- x.com/000.txt
 
-Notify with `n changed https://x.com/{identifier}` if the matching-pixel percentage is below 80%.
+and creates a list of ({url}, {site}, {name}) to monitor and sort it random, then every 30 seconds picks one item and perform a check and a notify.
 
-## LinkedIn
+Once the list has been emptied the files are read again and the loop restart
 
-Open `linkedin.com` once. For every non-empty, URL-encoded identifier in
-`linkedin/000.txt`, navigate to
-`https://linkedin.com/in/{identifier}/recent-activity/all` and compare the
-first screenshot part with `linkedin/{identifier}.png`, equivalent to:
+## x.com
+
+For every  account do:
 
 ```text
-g linkedin.com
-g https://linkedin.com/in/franco-bernab%C3%A8/recent-activity/all
-p 1 ?linkedin/franco-bernab%C3%A8.png
+g x.com/{name}
+d ?xcom/{name}.html ./xcom-latest.py
 ```
+
+If false notify with `n changed {url}` 
+
+## linkedin.com
+
+For eveyry account
+
+```text
+g https://linkedin.com/in/{name}/recent-activity/all
+d ?linkedin/{name}.html ./li-latest.py
+```
+
+If false notify with `n changed {url}` 
 
 Notify with
-`n changed https://linkedin.com/in/{identifier}/recent-activity/all` if the
-matching-pixel percentage is below 90%.
+`n changed https://linkedin.com/in/{name}/recent-activity/all` if false (post changed).
 
-When a baseline image is missing, `p 1 ?<image>` creates it and reports `100%`;
-do not notify for that first capture. Report a failed navigation or comparison
-to stderr, continue with the remaining accounts, and exit nonzero if any check
-failed.
+notifying with `n changed https://www.linkedin.com/company/{name}/posts/?feedView=all`.
+
+
+# fallback
+Any other output (no posts found, command error) is reported to stderr as a
+failure; continue with the remaining accounts.
+
+# notes
+- Usage: `./checks.py [path/to/.mcp.json]` (default `../.mcp.json`, the brepl
+  directory); the lines are sent to the `repl` tool of the `brepl` server.
+- It never starts brepl nor creates a profile: it uses the brepl already running
+  (with its profile); if none answers it exits with an error.
+- Files and scripts in `d` are given as absolute paths under `checks/`, since
+  brepl resolves them from its own directory.
+- `xcom/000.txt` and `linkedin/000.txt`: one url or name per line, `#` comments;
+  `linkedin.com/company/{name}` is saved as `linkedin/company-{name}.html`.
+

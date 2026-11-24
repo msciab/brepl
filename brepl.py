@@ -7,6 +7,8 @@
 #     "html2text>=2025.4.15",
 # ]
 # ///
+# Copyright 2026 Michele Sciabarrà
+# SPDX-License-Identifier: Apache-2.0
 """brepl: a REPL-driven headless Chrome browser."""
 
 import asyncio
@@ -40,15 +42,17 @@ HELP = """\
   g /<path>            go to path on the current origin (g /login)
   g /<substr>/         go to the first link whose 'l' line ([text] url) contains
                        substr, ignoring case
+  G <like g>           g, then p (show the page)
   u                    print current url
   p                    mark buttons (red, numbered), fields (blue, named),
-                       and links (green, numbered as in 'l', saved to link.txt);
-                       list images by size and source. Show the full-page
+                       and links (green, numbered as in 'l', saved to link.txt).
+                       Show the full-page
                        screenshot inline (blank parts skipped; saved as
                        page1.png ... pageN.png) + list in page.txt
   p [n] / pp [n]       n = parts to show and save (0 = all, default 1)
   p <n> <file>         make all the parts, show part n and copy it (png) to file
-  p <n> ?<file>        whole-number percentage of pixels matching the png in file
+  p <n> ?<file>        whole-number percentage of pixels matching the png in file,
+                       which is then replaced by part n
                        (missing file: create it from part n, print 100%)
   pp                   like p, with the page's images replaced by white space
   l [substr|/regex/]   list internal urls as [text] url, numbered, saved to link.txt
@@ -58,8 +62,13 @@ HELP = """\
                        fill fields (name prefix ok), then click button <num>
                        from the last p/pp, the button containing <text>, or the
                        first one whose text matches the regex (ignoring case)
+  s field=value ...    fill fields, then submit (Enter in the last one)
   d [file]             the page as markdown (no images): printed, or written to file;
                        always saved as page.html (rendered DOM) and page.md
+  d <file> <command>   pipe the page html to the shell command, write its output to
+                       file ('-' prints it), e.g. d out.txt grep -c href | tr -d ' '
+  d ?<file> [command]  true if the output (or markdown) equals file, else false;
+                       file is then replaced by the new output
   h [n]                no n: numbered history for the current site
                        n > 0: go to that entry; n < 0: step back n pages (h -1 = back)
   @                    switch between headless and headed (relaunches Chrome; the
@@ -75,6 +84,9 @@ LOCAL_PORTS = (12000, 14000)  # --local picks a free port at random in this rang
 # MCP screenshots: the full page as several images, top to bottom, so each stays legible
 # after a client downscales it; parts overlap so a badge on a boundary is whole in one
 MCP_TILE = 1600
+# after p/pp: drop the hidden-media style, and the marks too unless headed (keep=true)
+UNMARK_JS = """keep => document.querySelectorAll(keep ? '#brepl-noimg' : '.brepl-ov, #brepl-noimg')
+  .forEach(e => e.remove())"""
 MCP_OVERLAP = 40
 MCP_MAX_TILES = 20
 
@@ -96,6 +108,27 @@ def capturing() -> bool:
 
 TIMEOUT = 5000
 SUFFIXES = (".com", ".net", ".org")
+RATE, WINDOW = 4, 60.0  # at most RATE requests (page loads) per WINDOW seconds
+_requests: list[float] = []
+
+
+def throttle() -> None:
+    """Block until a request fits the rate limit, then record it."""
+    now = time.monotonic()
+    _requests[:] = [t for t in _requests if now - t < WINDOW]
+    if len(_requests) >= RATE:
+        wait = _requests[0] + WINDOW - now
+        print(f"(waiting {wait:.0f}s: max {RATE} requests/min)", flush=True)
+        time.sleep(wait)
+        _requests.pop(0)
+    _requests.append(time.monotonic())
+
+
+def goto(page, url: str) -> None:
+    throttle()
+    page.goto(url, wait_until="domcontentloaded")
+
+
 LINK_FILE = "link.txt"  # last 'l' listing, in the current directory
 PAGE_FILE = "page.txt"  # last 'p'/'pp' buttons and fields
 HTML_FILE = "page.html"  # last 'd': the rendered DOM
@@ -105,10 +138,17 @@ SHOT_FILE = re.compile(r"page\d+\.png$")  # last 'p'/'pp' parts: page1.png ... p
 # Scans visible buttons and input fields, tags them with data-brepl-* attributes and,
 # when draw is true, overlays red numbered boxes (buttons) / blue named boxes (fields).
 SCAN_JS = """
-({draw, buttons, links, images}) => {
+({draw, buttons, links}) => {
+  // querySelectorAll that also searches open shadow roots (web components), at any depth
+  const roots = [document];
+  for (let i = 0; i < roots.length; i++)
+    for (const e of roots[i].querySelectorAll('*')) if (e.shadowRoot) roots.push(e.shadowRoot);
+  const all = sel => roots.flatMap(r => [...r.querySelectorAll(sel)]);
+  // parent, crossing from a shadow root to its host
+  const up = e => e.parentElement || (e.getRootNode() instanceof ShadowRoot ? e.getRootNode().host : null);
   document.querySelectorAll('.brepl-ov').forEach(e => e.remove());
-  document.querySelectorAll('[data-brepl-field]').forEach(e => e.removeAttribute('data-brepl-field'));
-  if (buttons) document.querySelectorAll('[data-brepl-id]').forEach(e => e.removeAttribute('data-brepl-id'));
+  all('[data-brepl-field]').forEach(e => e.removeAttribute('data-brepl-field'));
+  if (buttons) all('[data-brepl-id]').forEach(e => e.removeAttribute('data-brepl-id'));
   // laid out at all (fillable / clickable by playwright)
   const visible = el => {
     const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
@@ -120,15 +160,16 @@ SCAN_JS = """
   const shown = el => {
     const r = el.getBoundingClientRect();
     let x1 = r.left, y1 = r.top, x2 = r.right, y2 = r.bottom, fixed = false, opacity = 1;
-    for (let a = el; a && a !== document.documentElement; a = a.parentElement) {
+    for (let a = el; a && a !== document.documentElement; a = up(a)) {
       const cs = getComputedStyle(a);
       opacity *= parseFloat(cs.opacity);
-      if (cs.position === 'fixed') fixed = true;
-      if (a !== el && a !== document.body && /hidden|auto|scroll|clip/.test(cs.overflowX + cs.overflowY)) {
+      // a fixed element escapes the overflow of the ancestors above it (modals)
+      if (!fixed && a !== el && a !== document.body && /hidden|auto|scroll|clip/.test(cs.overflowX + cs.overflowY)) {
         const q = a.getBoundingClientRect();
         x1 = Math.max(x1, q.left); y1 = Math.max(y1, q.top);
         x2 = Math.min(x2, q.right); y2 = Math.min(y2, q.bottom);
       }
+      if (cs.position === 'fixed') fixed = true;
     }
     if (fixed) {
       x1 = Math.max(x1, 0); y1 = Math.max(y1, 0);
@@ -160,12 +201,12 @@ SCAN_JS = """
       {background: color, color: ink, whiteSpace: 'nowrap'});
     document.body.append(box, tag);
   };
-  const clip = s => (s || '').replace(/\\s+/g, ' ').trim().slice(0, 60);
+  const clip = s => [...(s || '').replace(/\\s+/g, ' ').trim()].slice(0, 60).join('');  // by code point: no split surrogates
 
-  const out = {buttons: [], fields: [], images: []};
+  const out = {buttons: [], fields: []};
   const bsel = 'button, [role=button], input[type=button], input[type=submit], input[type=reset]';
   let n = 0;
-  for (const el of document.querySelectorAll(bsel)) {
+  for (const el of all(bsel)) {
     if (!visible(el)) continue;
     const rect = shown(el);
     if (buttons) {  // number only buttons that can be seen, so list and image agree
@@ -177,35 +218,28 @@ SCAN_JS = """
     out.buttons.push({id, label: clip(el.innerText || el.value || el.getAttribute('aria-label') || el.title)});
     overlay(rect, 'red', id);
   }
-  const fsel = 'input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]):not([type=image]), textarea, select';
+  const fsel = 'input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]):not([type=image]), textarea, select, ' +
+    '[contenteditable=""], [contenteditable=true], [contenteditable=plaintext-only]';
   let k = 0;
-  for (const el of document.querySelectorAll(fsel)) {
+  for (const el of all(fsel)) {
     if (!visible(el)) continue;
+    const editable = el.isContentEditable && !/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName);
+    if (editable && up(el) && up(el).isContentEditable) continue;  // only the editor's root
     k++;
-    const name = el.name || el.id || el.getAttribute('aria-label') || el.placeholder || ('field' + k);
+    const name = el.name || el.id || el.getAttribute('aria-label') || el.placeholder ||
+      el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || ('field' + k);
     el.setAttribute('data-brepl-field', String(k));
     // fields are registered even when not shown (e.g. custom-styled radios) so they can be filled
     const rect = shown(el);
     out.fields.push({key: String(k), name, form: el.form ? [...document.forms].indexOf(el.form) : -1,
-                     type: el.tagName === 'INPUT' ? (el.type || 'text') : el.tagName.toLowerCase(),
-                     value: clip(el.value), shown: !!rect});
+                     type: editable ? 'editable' : el.tagName === 'INPUT' ? (el.type || 'text') : el.tagName.toLowerCase(),
+                     value: clip(editable ? el.innerText : el.value), shown: !!rect});
     overlay(rect, 'blue', name);
-  }
-  // List images seen in the screenshot that are at least 24px each way
-  // (skips icons and tracking pixels).
-  if (images) {
-    for (const el of document.querySelectorAll('img')) {
-      if (!visible(el)) continue;
-      const rect = shown(el);
-      if (!rect || rect.w < 24 || rect.h < 24) continue;
-      out.images.push({w: Math.round(rect.w), h: Math.round(rect.h),
-                       src: (el.currentSrc || el.src || '').slice(0, 120)});
-    }
   }
   // links: green, numbered like the 'l' listing (every anchor of a url gets its number)
   if (links) {
     const num = new Map(links.map((u, i) => [u, i + 1]));
-    for (const a of document.querySelectorAll('a[href]')) {
+    for (const a of all('a[href]')) {
       const n = num.get(a.href.split('#')[0]);
       if (n) overlay(shown(a), '#080', String(n), 1, true);
     }
@@ -375,7 +409,10 @@ class State:
         """Headed: show the current page (after g/c/h navigated it)."""
         if self.headed:
             try:
-                self.page.bring_to_front()
+                # bring_to_front activates Chrome and steals the keyboard focus from
+                # the app the user is typing in: only do it to switch tabs
+                if self.page.evaluate("() => document.visibilityState") != "visible":
+                    self.page.bring_to_front()
             except PWError:
                 pass
 
@@ -414,11 +451,11 @@ def settle(page) -> None:
 
 LINKS_JS = """
 els => els.map(e => [e.getAttribute('href'), e.href,
-  (e.innerText || e.getAttribute('aria-label') || e.title ||
+  [...(e.innerText || e.getAttribute('aria-label') || e.title ||
    (e.querySelector('img[alt]') || {}).alt ||
    ((e.querySelector('[title], [aria-label]') || {getAttribute: () => ''}).getAttribute('title') ||
     (e.querySelector('[aria-label]') || {getAttribute: () => ''}).getAttribute('aria-label')) ||
-   '').replace(/\\s+/g, ' ').trim().slice(0, 60)])
+   '').replace(/\\s+/g, ' ').trim()].slice(0, 60).join('')])
 """
 
 
@@ -460,32 +497,32 @@ def candidates(arg: str) -> list[str]:
     return [url] + [u._replace(netloc=u.netloc + s).geturl() for s in SUFFIXES]
 
 
-def cmd_go(st: State, arg: str) -> None:
+def cmd_go(st: State, arg: str) -> bool:
+    """g: navigate; True if a page was opened."""
     page = st.page
     if not arg:
         print("usage: g <url>|<num>|/<path>|/<substr>/")
-        return
+        return False
     if len(arg) > 2 and arg.startswith("/") and arg.endswith("/"):
-        go_match(st, arg[1:-1])
-        return
+        return go_match(st, arg[1:-1])
     if arg.startswith("/"):  # a path on the current origin
         u = urlparse(page.url)
         if u.scheme not in ("http", "https"):
             print(f"no current site for {arg}")
-            return
-        page.goto(f"{u.scheme}://{u.netloc}{arg}", wait_until="domcontentloaded")
+            return False
+        goto(page, f"{u.scheme}://{u.netloc}{arg}")
         settle(page)
         show(page)
-        return
+        return True
     if arg.isdigit():
         i = int(arg)
         if not 1 <= i <= len(st.links):
             print(f"no link {i} (run l or p first; {len(st.links)} links listed)")
-            return
-        page.goto(st.links[i - 1], wait_until="domcontentloaded")
+            return False
+        goto(page, st.links[i - 1])
         settle(page)
         show(page)
-        return
+        return True
     errors = []
     for url in candidates(arg):
         host = urlparse(url).hostname or ""
@@ -493,7 +530,7 @@ def cmd_go(st: State, arg: str) -> None:
             errors.append(f"{host}: does not resolve")
             continue
         try:
-            page.goto(url, wait_until="domcontentloaded")
+            goto(page, url)
         except PWError as e:
             msg = str(e).splitlines()[0]
             if "interrupted by another navigation" not in msg:
@@ -505,13 +542,14 @@ def cmd_go(st: State, arg: str) -> None:
             errors.append(f"{host}: failed to load")
             continue
         show(page)
-        return
+        return True
     print("error: could not open " + arg)
     for e in errors:
         print(f"  {e}")
+    return False
 
 
-def go_match(st: State, sub: str) -> None:
+def go_match(st: State, sub: str) -> bool:
     """Follow the first internal link whose listing line ([text] url) contains sub,
     case-insensitive. Ranked: whole word in an anchor text, then anywhere in an
     anchor text, then in the url, so /next/ picks 'Next page' over 'girlnextdoor'."""
@@ -531,12 +569,13 @@ def go_match(st: State, sub: str) -> None:
     hits = [u for _, _, u in sorted(ranked)]
     if not hits:
         print(f"no link containing {sub!r}")
-        return
+        return False
     if len(hits) > 1:
         print(f"({len(hits)} links contain {sub!r}, following the first)")
-    st.page.goto(hits[0], wait_until="domcontentloaded")
+    goto(st.page, hits[0])
     settle(st.page)
     show(st.page)
+    return True
 
 
 def page_markdown(page, html: str | None = None) -> str:
@@ -554,7 +593,7 @@ def cmd_dump(st: State, path: str) -> None:
     md = page_markdown(st.page, html)
     for name, text in ((HTML_FILE, html), (MD_FILE, md)):  # always: the last d
         try:
-            with open(name, "w") as fh:
+            with open(name, "w", encoding="utf-8", errors="replace") as fh:
                 fh.write(text)
         except OSError as e:
             print(f"warning: cannot write {name}: {e}")
@@ -562,22 +601,68 @@ def cmd_dump(st: State, path: str) -> None:
         print(md.rstrip("\n"))
         print(f"(saved {HTML_FILE}, {MD_FILE})")
         return
+    path, _, command = path.strip().partition(" ")
+    command = command.strip()
+    check = path.startswith("?")
+    if check:
+        path = path[1:]
+        if not path:
+            print("usage: d ?<file> [command]")
+            return
+    if command:  # page html | sh -c command, as typed (quotes, pipes ...)
+        try:
+            r = subprocess.run(command, shell=True, input=html.encode("utf-8", "replace"),
+                               capture_output=True)
+        except OSError as e:
+            print(f"error: cannot run {command!r}: {e}")
+            return
+        if r.stderr:
+            print(r.stderr.decode("utf-8", "replace").rstrip("\n"))
+        if r.returncode:
+            print(f"error: command exited with {r.returncode}")
+            if check:  # don't replace the reference with a failed run
+                return
+        md = r.stdout.decode("utf-8", "replace")
+        if path == "-":
+            print(md.rstrip("\n"))
+            return
     path = os.path.expanduser(path)
+    if check:  # same as the last output? then this output becomes the reference
+        new = r.stdout if command else md.encode("utf-8", "replace")
+        try:
+            with open(path, "rb") as fh:
+                same = fh.read() == new
+        except FileNotFoundError:
+            same = True  # no reference yet: it matches itself
+        except OSError as e:
+            print(f"error: cannot read {path}: {e}")
+            return
+        try:
+            if os.path.dirname(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(new)
+        except OSError as e:
+            print(f"error: cannot write {path}: {e}")
+            return
+        print("true" if same else "false")
+        return
     try:
         if os.path.dirname(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8", errors="replace") as fh:
             fh.write(md)
     except OSError as e:
         print(f"error: cannot write {path}: {e}")
         return
-    print(f"{st.page.url} -> {path} ({len(md.splitlines())} lines)")
+    via = f" | {command}" if command else ""
+    print(f"{st.page.url}{via} -> {path} ({len(md.splitlines())} lines)")
 
 
 def save(path: str, url: str, lines: list[str]) -> None:
     """Overwrite path with the listing just printed, headed by the page url."""
     try:
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8", errors="replace") as fh:  # pages may hold lone surrogates
             fh.write("\n".join([url, *lines]) + "\n")
     except OSError as e:
         print(f"warning: cannot write {path}: {e}")
@@ -586,7 +671,7 @@ def save(path: str, url: str, lines: list[str]) -> None:
 P_USAGE = "usage: p [n] | p <n> <file> | p <n> ?<file>   (also pp; n parts, 0 = all, default 1)"
 
 
-def cmd_print(st: State, images: bool, arg: str = "") -> None:
+def cmd_print(st: State, images: bool, arg: str = "", header: bool = True) -> None:
     """p/pp [n]: show and save n (non-blank) parts, 0 = all, default 1.
     p <n> <file>: make parts up to n, show part n and write it to file (no pageN.png).
     p <n> ?<file>: make parts up to n and print the percentage of matching pixels."""
@@ -613,8 +698,8 @@ def cmd_print(st: State, images: bool, arg: str = "") -> None:
     found = internal_urls(page)  # numbered exactly like an unfiltered 'l'
     st.links = [u for u, _ in found]
     save(LINK_FILE, page.url, link_lines(found))
-    info = page.evaluate(SCAN_JS, {"draw": True, "buttons": True, "links": st.links, "images": True})
-    if not check:
+    info = page.evaluate(SCAN_JS, {"draw": True, "buttons": True, "links": st.links})
+    if not check and header:  # G: g already printed it
         show(page)
     # the full page as jpeg parts 1600px high, top to bottom: MCP clients downscale
     # big images, and terminals drop them (VS Code/xterm.js: ~16M pixels, ~20MB).
@@ -626,9 +711,12 @@ def cmd_print(st: State, images: bool, arg: str = "") -> None:
     # part n is the same from the REPL and over MCP
     overlap = MCP_OVERLAP if mcp and not target else 0
     height = page.evaluate("() => document.documentElement.scrollHeight")
-    view = page.viewport_size
+    view = page.viewport_size or page.evaluate(  # None when headed (no_viewport)
+        "() => ({width: innerWidth, height: innerHeight})")
     width = view["width"]
-    tops = list(range(0, max(height - overlap, 1), MCP_TILE - overlap))
+    # headed: resizing the viewport resizes (undocks) the visible window, so keep it
+    tile = view["height"] if st.headed else MCP_TILE
+    tops = list(range(0, max(height - overlap, 1), tile - overlap))
     if mcp and not target and not 0 < limit <= MCP_MAX_TILES:  # images go into the client's context
         limit = MCP_MAX_TILES
     for f in [] if target else os.listdir("."):  # the previous page's parts
@@ -640,7 +728,8 @@ def cmd_print(st: State, images: bool, arg: str = "") -> None:
     saved: list[str] = []
     blank = shown = 0
     more = False  # stopped at the limit with parts left
-    page.set_viewport_size({"width": width, "height": MCP_TILE})
+    if not st.headed:
+        page.set_viewport_size({"width": width, "height": tile})
     try:
         for i, y in enumerate(tops):
             if limit and shown == limit:
@@ -649,8 +738,8 @@ def cmd_print(st: State, images: bool, arg: str = "") -> None:
             page.evaluate("y => window.scrollTo(0, y)", y)
             page.wait_for_timeout(250)  # let the list render what scrolled in
             sy = page.evaluate("() => window.scrollY")  # clamped near the bottom
-            top = max(0, min(y - sy, MCP_TILE - 1))
-            clip = {"x": 0, "y": top, "width": width, "height": max(1, min(MCP_TILE - top, height - y))}
+            top = max(0, min(y - sy, tile - 1))
+            clip = {"x": 0, "y": top, "width": width, "height": max(1, min(tile - top, height - y))}
             if not page.evaluate(HAS_CONTENT_JS, {"top": clip["y"], "height": clip["height"]}):
                 blank += 1  # nothing rendered there: don't show or save it
                 continue
@@ -669,25 +758,26 @@ def cmd_print(st: State, images: bool, arg: str = "") -> None:
                 iterm2_image(page.screenshot(clip=clip, type="jpeg", quality=75 if mcp else 85))
             shown += 1
     finally:
-        page.set_viewport_size(view)
+        if not st.headed:
+            page.set_viewport_size(view)
         page.evaluate("() => window.scrollTo(0, 0)")
     if target:
-        page.evaluate("() => document.querySelectorAll('.brepl-ov, #brepl-noimg').forEach(e => e.remove())")
+        page.evaluate(UNMARK_JS, st.headed)
         save(PAGE_FILE, page.url, [])  # stale lists must not survive
         part_file(page, target, saved, check, path)
         return
     if mcp and shown > 1:
-        print(f"(page {height}px high, in {shown} images of {MCP_TILE}px, top to bottom,"
+        print(f"(page {height}px high, in {shown} images of {tile}px, top to bottom,"
               f" overlapping {MCP_OVERLAP}px)")
     if blank:
-        print(f"({blank} blank part{'s' if blank > 1 else ''} of {MCP_TILE}px not shown)")
+        print(f"({blank} blank part{'s' if blank > 1 else ''} of {tile}px not shown)")
     if more:
         left = len(tops) - i
         print(f"(page {height}px high: {shown} part{'s' if shown > 1 else ''} shown, up to {left}"
               f" more below; " + ("pages=N or 0 for more)" if mcp else "p <n> or p 0 for more)"))
     if saved:
         print(f"saved {saved[0]}" + (f" ... {saved[-1]}" if len(saved) > 1 else ""))
-    page.evaluate("() => document.querySelectorAll('.brepl-ov, #brepl-noimg').forEach(e => e.remove())")
+    page.evaluate(UNMARK_JS, st.headed)
     lines = [f"buttons ({len(info['buttons'])}):"]
     lines += [f"  {b['id']:>3}  {b['label']}" for b in info["buttons"]]
     lines.append(f"fields ({len(info['fields'])}):")
@@ -695,8 +785,6 @@ def cmd_print(st: State, images: bool, arg: str = "") -> None:
         val = f"  = {f['value']!r}" if f["value"] else ""
         hidden = "" if f["shown"] else "  (not shown)"
         lines.append(f"       {f['name']}  [{f['type']}]{val}{hidden}")
-    lines.append(f"images ({len(info['images'])}):")
-    lines += [f"  {i['w']}x{i['h']}  {i['src']}" for i in info["images"]]
     print("\n".join(lines))
     print(f"links ({len(found)}): numbered in green, listed in {LINK_FILE} (g <num> to follow)")
     save(PAGE_FILE, page.url, lines)
@@ -728,11 +816,18 @@ def part_file(page, n: int, saved: list[bytes | None], check: bool, path: str) -
                 reference = base64.b64encode(fh.read()).decode("ascii")
             current = base64.b64encode(png).decode("ascii")
             percentage = page.evaluate(PIXEL_DIFF_JS, {"current": current, "reference": reference})
-            print(percentage)
         except OSError as e:
             print(f"error: cannot read comparison image {path}: {e}")
+            return
         except Exception as e:
             print(f"error: cannot compare image {path}: {str(e).splitlines()[0]}")
+            return
+        try:  # part n becomes the reference for the next check
+            with open(path, "wb") as fh:
+                fh.write(png)
+        except OSError as e:
+            print(f"warning: cannot update {path}: {e}")
+        print(percentage)
         return
     try:
         if os.path.dirname(path):
@@ -780,8 +875,9 @@ def cmd_list(st: State, sub: str) -> None:
     save(LINK_FILE, st.page.url, lines)
 
 
-def fill_fields(page, assigns: list[tuple[str, str]], form: int) -> bool:
-    """Fill fields matched by exact name or unique prefix. Returns False if any failed.
+def fill_fields(page, assigns: list[tuple[str, str]], form: int) -> list | None:
+    """Fill fields matched by exact name or unique prefix. Returns the filled fields,
+    None if any failed.
     Same-named fields (e.g. login vs signup form) resolve to the one in `form`."""
     fields = page.evaluate(SCAN_JS, {"draw": False, "buttons": False})["fields"]
     plan = []
@@ -789,16 +885,16 @@ def fill_fields(page, assigns: list[tuple[str, str]], form: int) -> bool:
         hits = [f for f in fields if f["name"] == name] or [f for f in fields if f["name"].startswith(name)]
         if not hits:
             print(f"no field matching {name!r}")
-            return False
+            return None
         if len({f["name"] for f in hits}) > 1:
             print(f"warning: {name!r} is ambiguous: {', '.join(sorted({f['name'] for f in hits}))}")
-            return False
+            return None
         radios = [f for f in hits if f["type"] == "radio"]
         if radios:  # radio group: pick the option by value, e.g. amount=10
             opt = next((f for f in radios if f["value"].lower() == value.lower()), None)
             if opt is None:
                 print(f"no {hits[0]['name']!r} option {value!r}: {', '.join(f['value'] for f in radios)}")
-                return False
+                return None
             plan.append((opt, value))
             continue
         plan.append((next((f for f in hits if f["form"] == form), hits[0]), value))
@@ -814,7 +910,7 @@ def fill_fields(page, assigns: list[tuple[str, str]], form: int) -> bool:
         else:
             loc.fill(value, timeout=TIMEOUT)
         print(f"  {f['name']} = {value!r}")
-    return True
+    return [f for f, _ in plan]
 
 
 def cmd_click(st: State, arg: str) -> None:
@@ -870,12 +966,36 @@ def cmd_click(st: State, arg: str) -> None:
             return
     if assigns:
         form = loc.first.evaluate("el => el.form ? [...document.forms].indexOf(el.form) : -1")
-        if not fill_fields(page, assigns, form):
+        if fill_fields(page, assigns, form) is None:
             return
+    act(st, lambda: loc.first.click(timeout=TIMEOUT))
+
+
+def cmd_submit(st: State, arg: str) -> None:
+    """s field=value ...: fill the fields, then press Enter in the last one."""
+    try:
+        toks = shlex.split(arg)
+    except ValueError as e:
+        print(f"parse error: {e}")
+        return
+    if not toks or any("=" not in t for t in toks):
+        print("usage: s <field>=<value> [...]")
+        return
+    filled = fill_fields(st.page, [tuple(t.split("=", 1)) for t in toks], -1)
+    if filled is None:
+        return
+    loc = st.page.locator(f'[data-brepl-field="{filled[-1]["key"]}"]')
+    act(st, lambda: loc.press("Enter", timeout=TIMEOUT))
+
+
+def act(st: State, action) -> None:
+    """Run a click/submit, follow a new tab, wait, print the new url or (same page)."""
+    page = st.page
     before = page.url
     st.new_pages.clear()
     st.navs = 0
-    loc.first.click(timeout=TIMEOUT)
+    throttle()
+    action()
     page.wait_for_timeout(500)  # give a navigation the chance to start
     if st.new_pages:  # click opened a new tab: follow it
         st.page = st.new_pages[-1]
@@ -915,7 +1035,7 @@ def cmd_history(st: State, arg: str) -> None:
     else:
         print("usage: h [n]  (n != 0)")
         return
-    st.page.goto(st.history[target], wait_until="domcontentloaded")
+    goto(st.page, st.history[target])
     settle(st.page)
     st.pos = target
     show(st.page)
@@ -937,7 +1057,9 @@ def launch(pw, profile: str | None = None, headed: bool = False):
             # Playwright passes --no-sandbox by default: Chrome then shows an
             # "unsupported command-line flag" bar (and runs less safely)
             "chromium_sandbox": True}
-    view = {"viewport": {"width": 1280, "height": 800}}
+    # headed: no fixed viewport, the page fills the window (else an empty band
+    # shows when the window is bigger than 1280x800)
+    view = {"no_viewport": True} if headed else {"viewport": {"width": 1280, "height": 800}}
     for channel in ({"channel": "chrome"}, {}):
         try:
             if profile:
@@ -1023,6 +1145,9 @@ def dispatch(st: State, line: str) -> None:
             print(HELP)
         elif cmd == "g":
             cmd_go(st, arg)
+        elif cmd == "G":
+            if cmd_go(st, arg):
+                cmd_print(st, images=True, header=False)
         elif cmd == "u":
             print(st.page.url)
         elif cmd == "p":
@@ -1033,6 +1158,8 @@ def dispatch(st: State, line: str) -> None:
             cmd_list(st, arg)
         elif cmd == "c":
             cmd_click(st, arg)
+        elif cmd == "s":
+            cmd_submit(st, arg)
         elif cmd == "h":
             cmd_history(st, arg)
         elif cmd == "d":
@@ -1041,7 +1168,7 @@ def dispatch(st: State, line: str) -> None:
             cmd_notify(arg)
         else:
             print("unknown command, type ? for help")
-        if cmd in ("g", "c", "h") and (cmd != "h" or arg):
+        if cmd in ("g", "G", "c", "s", "h") and (cmd != "h" or arg):
             st.front()  # headed: see where g/c/h went
         st.touch()
     except PWError as e:
@@ -1243,8 +1370,8 @@ def start_mcp(worker: Worker, port: int) -> bool:
         """Full-page screenshot of the current page, as several images top to bottom
         for tall pages (1600px parts overlapping 40px), with buttons outlined in red and
         numbered, input fields outlined in blue with their name, and internal links
-        outlined in green and numbered (same numbers as links()). Images are listed
-        with their size and source. Also returns the list of buttons, fields, and images.
+        outlined in green and numbered (same numbers as links()). Also returns the list
+        of buttons and fields.
         hide_images replaces the page's images with white.
         pages: how many (non-blank) 1600px parts to return, from the top; 0 = all
         (at most 20). Default 1: ask for more only when the lower page matters."""
@@ -1260,7 +1387,8 @@ def start_mcp(worker: Worker, port: int) -> bool:
     @server.tool()
     async def same_page(n: int, file: str, hide_images: bool = False) -> str:
         """Return the whole-number percentage of pixels in part n that match the png in file.
-        Pixels present in only one image count as changed. If file does not exist,
+        Pixels present in only one image count as changed. Part n then replaces
+        file (so the next call compares with this one). If file does not exist,
         part n is saved there and 100% is returned."""
         return await run(f"{'pp' if hide_images else 'p'} {n} ?{file}")
 
@@ -1285,11 +1413,31 @@ def start_mcp(worker: Worker, port: int) -> bool:
         return await run("c " + " ".join(args))
 
     @server.tool()
-    async def dump(file: str = "") -> str:
+    async def submit(fields: dict[str, str]) -> str:
+        """Fill fields ({name or unique name prefix: value}), then submit by pressing
+        Enter in the last one, e.g. {"q": "python"} to search. Returns the new url if
+        the page changed, else '(same page)'."""
+        return await run("s " + " ".join(shlex.quote(f"{k}={v}") for k, v in fields.items()))
+
+    @server.tool()
+    async def dump(file: str = "", command: str = "") -> str:
         """The current page converted to markdown (no images; links kept as absolute
         urls). With file, write it there (relative to brepl's directory) instead
-        of returning it."""
+        of returning it. With command, the page html is piped to that shell command
+        (as is: quotes, pipes ...) and its output written to file, or returned
+        if there is no file."""
+        if command:
+            return await run(f"d {file or '-'} {command}")
         return await run(f"d {file}".strip())
+
+    @server.tool()
+    async def same_dump(file: str, command: str = "") -> str:
+        """'true' if the output of command (a shell command, as is, fed the page
+        html) or, without command, the page markdown is the same as the content
+        of file, else 'false'. file is then replaced by the new output, so the next
+        call tells whether the page changed since this one. Missing file: written,
+        'true'."""
+        return await run(f"d ?{file} {command}".strip())
 
     @server.tool()
     async def toggle_headed() -> str:
@@ -1409,8 +1557,8 @@ AGENTS_BLOCK = f"""{AGENTS_START}
 
 A brepl browser is available as the `brepl` MCP server. When a chat message is a
 brepl command line (`?`, `g <url|num|/substr/>`, `u`, `p [n]`, `pp [n]`,
-`p <n> ?<image>`, `l [filter]`, `c <button> [field=value ...]`,
-`d [file]`, `h [n]`, `@`,
+`G <url|num|/substr/>`, `p <n> ?<image>`, `l [filter]`, `c <button> [field=value ...]`, `s field=value ...`,
+`d [file] [command]`, `h [n]`, `@`,
 `n <message>`), call the
 `repl` tool with the message verbatim and show its output as is; the images from
 `p`/`pp` are the page. `?` lists the commands.
@@ -1503,8 +1651,17 @@ class Brepl:
         args += [shlex.quote(f"{k}={v}") for k, v in (fields or {}).items()]
         return self.run("c " + " ".join(args))
 
-    def dump(self, file: str = "") -> str:
+    def submit(self, fields: dict[str, str]) -> str:
+        """s: fill fields, then press Enter in the last one."""
+        return self.run("s " + " ".join(shlex.quote(f"{k}={v}") for k, v in fields.items()))
+
+    def dump(self, file: str = "", command: str = "") -> str:
+        if command:
+            return self.run(f"d {file or '-'} {command}")
         return self.run(f"d {file}".strip())
+
+    def same_dump(self, file: str, command: str = "") -> str:
+        return self.run(f"d ?{file} {command}".strip())
 
     def history(self, n: int | None = None) -> str:
         return self.run("h" if n is None else f"h {n}")
