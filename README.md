@@ -49,7 +49,7 @@ session is kept. The profile holds session cookies: keep it private (git-ignored
 
 Full behaviour: [spec/1-spec.md](spec/1-spec.md) (REPL), [spec/2-mcp.md](spec/2-mcp.md) (MCP).
 
-If Chrome isn't installed: `uvx playwright install chromium`.
+brepl uses Playwright's own Chromium (not your Chrome), installed on first run.
 
 ## License
 

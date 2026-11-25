@@ -48,6 +48,13 @@ in the page, e.g. `n` opens x.com's compose box).
 Headless, the current page only changes by commands (and a closed tab falls back
 to another): pop-ups opened by sites are not followed.
 
+### Browser
+
+brepl always runs Playwright's own Chromium (`channel="chromium"`: the full
+browser, also when headless), never the installed Google Chrome, so it doesn't
+interfere with the user's Chrome. If it isn't installed yet, brepl runs
+`playwright install chromium` once and retries.
+
 ### Not announcing automation
 
 Chrome is launched without `--enable-automation`, a script run in every page

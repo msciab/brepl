@@ -1047,7 +1047,7 @@ Object.defineProperty(Navigator.prototype, 'webdriver', {get: () => false, confi
 
 
 def launch(pw, profile: str | None = None, headed: bool = False):
-    """Start Chrome (or Playwright's Chromium) and return (closer, context). With a
+    """Start Playwright's Chromium and return (closer, context). With a
     profile dir, the context is persistent: cookies, localStorage etc. are kept there
     across runs; without, everything is thrown away on quit."""
     # don't announce automation (--enable-automation): sites like x.com refuse to log
@@ -1060,7 +1060,10 @@ def launch(pw, profile: str | None = None, headed: bool = False):
     # headed: no fixed viewport, the page fills the window (else an empty band
     # shows when the window is bigger than 1280x800)
     view = {"no_viewport": True} if headed else {"viewport": {"width": 1280, "height": 800}}
-    for channel in ({"channel": "chrome"}, {}):
+    # always Playwright's own Chromium (full browser, new headless), never the
+    # user's Chrome; installed on first use
+    channel = {"channel": "chromium"}
+    for attempt in range(2):
         try:
             if profile:
                 ctx = pw.chromium.launch_persistent_context(profile, **channel, **opts, **view)
@@ -1074,8 +1077,10 @@ def launch(pw, profile: str | None = None, headed: bool = False):
         except PWError as e:
             if profile and ("SingletonLock" in str(e) or "ProcessSingleton" in str(e)):
                 sys.exit(f"profile {profile} is in use by another brepl/Chrome")
-            last = e
-    sys.exit(f"no Chrome found ({str(last).splitlines()[0]}); run: uvx playwright install chromium")
+            if attempt or "Executable doesn't exist" not in str(e):
+                sys.exit(f"cannot start Chromium: {str(e).splitlines()[0]}")
+            print("installing Playwright's Chromium...", flush=True)
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
 
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
